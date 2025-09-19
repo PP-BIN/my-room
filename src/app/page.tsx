@@ -1,9 +1,14 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useEffect, useMemo, useRef, useState, useCallback,
+  type MutableRefObject,
+} from 'react';
+import type { ReactNode, ButtonHTMLAttributes } from 'react';
 import * as THREE from 'three';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Environment, ContactShadows, OrthographicCamera, Html, MapControls } from '@react-three/drei';
+import type { MapControls as MapControlsImpl } from 'three-stdlib';
 
 /* ───────────────── Types & Constants ───────────────── */
 type StepPreset = 'fine' | 'med' | 'coarse';
@@ -29,23 +34,23 @@ type Item = {
 
 type Theme = { name: string; floor: string; wall: string };
 
-/* ── Room size: “놓을 수 있는 구역”을 정확히 표현 ── */
-const ROOM = {
-  halfX: 3.0,          // X 방향 반폭 => 전체 폭 6m
-  halfZ: 3.0,          // Z 방향 반깊이 => 전체 깊이 6m
-  height: 3.0,
-};
+type DragKind = 'floor' | 'back' | 'left' | null;
+type DragState = { id: string | null; kind: DragKind; offset: THREE.Vector3 };
+
+type Steps = { grid: number; gridY: number; move: number; rotate: number; scale: number };
+
+/* ── Room size: “놓을 수 있는 구역” ── */
+const ROOM = { halfX: 3.0, halfZ: 3.0, height: 3.0 };
 const WALL = { thick: 0.12, eps: 0.002 };
 const WORLD = {
   FLOOR_Y: 0,
-  // 벽 박스의 '중심' 좌표 (앞면은 FRONT.* 로 사용)
   BACK_Z: -ROOM.halfZ - WALL.thick / 2,
   LEFT_X: -ROOM.halfX - WALL.thick / 2,
-  LIMIT_X: ROOM.halfX,    // 바닥 이동 한계(정확히 방 바닥 경계)
+  LIMIT_X: ROOM.halfX,
   LIMIT_Z: ROOM.halfZ,
 };
 const FRONT = {
-  BACK_Z: -ROOM.halfZ + WALL.eps, // 보이는 앞면
+  BACK_Z: -ROOM.halfZ + WALL.eps,
   LEFT_X: -ROOM.halfX + WALL.eps,
 };
 
@@ -66,37 +71,98 @@ const DEG = (d: number) => (d * Math.PI) / 180;
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 const quantize = (v: number, g: number) => Math.round(v / g) * g;
 const isWallType = (t: ItemType) => t === 'window' || t === 'frame' || t === 'mirror';
-const defaultWall: Record<ItemType, WallSide | undefined> = { window: 'back', frame: 'left', mirror: 'back' } as any;
+const defaultWall: Partial<Record<ItemType, WallSide>> = {
+  window: 'back',
+  frame: 'left',
+  mirror: 'back',
+} as const;
 
-// 상판 스냅 대상/스택 가능 대상
 const SUPPORT_TYPES: ItemType[] = ['desk', 'dresser'];
 const STACKABLE_TYPES: ItemType[] = ['tv', 'plant', 'lamp', 'trash'];
 
 /* ───────────────── Main Page ───────────────── */
 export default function Page() {
   const [themeIdx, setThemeIdx] = useState(0);
-  const [zoom, setZoom] = useState(120); // UI로만 조절; 마우스휠 줌은 비활성
+  const [zoom, setZoom] = useState(120);
   const [stepPreset, setStepPreset] = useState<StepPreset>('med');
   const [items, setItems] = useState<Item[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hideLabels, setHideLabels] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
 
+  // 화면 팬 제어(ref): 드래그 중에는 비활성화
+  const controlsRef = useRef<MapControlsImpl | null>(null);
+
   const theme = THEMES[themeIdx];
-  const steps = useMemo(() => {
+  const steps: Steps = useMemo(() => {
     if (stepPreset === 'fine') return { move: 0.12, rotate: 5, scale: 0.02, grid: 0.12, gridY: 0.08 };
     if (stepPreset === 'coarse') return { move: 0.5, rotate: 30, scale: 0.1, grid: 0.5, gridY: 0.25 };
     return { move: 0.25, rotate: 15, scale: 0.05, grid: 0.25, gridY: 0.16 };
   }, [stepPreset]);
 
-  /* ── Add ── */
+  /* ── Save / Load / Export / Import ── */
+  const STORAGE_KEY = 'room-builder-save-v1';
+
+  const doSaveLocal = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const payload = { version: 1, items, themeIdx, zoom };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    alert('저장 완료!');
+  }, [items, themeIdx, zoom]);
+
+  const doLoadLocal = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) { alert('저장된 데이터가 없어요.'); return; }
+    try {
+      const data = JSON.parse(raw) as { items: Item[]; themeIdx: number; zoom: number };
+      if (Array.isArray(data.items)) setItems(data.items);
+      if (typeof data.themeIdx === 'number') setThemeIdx(data.themeIdx);
+      if (typeof data.zoom === 'number') setZoom(data.zoom);
+      setSelectedId(null);
+      alert('불러오기 완료!');
+    } catch {
+      alert('불러오기 실패(형식 오류).');
+    }
+  }, []);
+
+  const doExportJSON = useCallback(() => {
+    const payload = { version: 1, items, themeIdx, zoom };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'room-save.json'; a.click();
+    URL.revokeObjectURL(url);
+  }, [items, themeIdx, zoom]);
+
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const doImportJSON = useCallback((file?: File) => {
+    const f = file ?? fileRef.current?.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result || '{}')) as { items?: Item[]; themeIdx?: number; zoom?: number };
+        if (Array.isArray(data.items)) setItems(data.items);
+        if (typeof data.themeIdx === 'number') setThemeIdx(data.themeIdx);
+        if (typeof data.zoom === 'number') setZoom(data.zoom);
+        setSelectedId(null);
+        alert('가져오기 완료!');
+      } catch {
+        alert('가져오기 실패(형식 오류).');
+      }
+    };
+    reader.readAsText(f);
+  }, []);
+
+  /* ── Add / Remove ── */
   const addItem = (type: ItemType) => {
     const id = `${type}-${Date.now()}-${(Math.random() * 1e5) | 0}`;
     const props: Item['props'] = {};
     if (type === 'bed') props.bedSheet = '#C7D6E8';
     if (type === 'rug') { props.rugW = 1.6; props.rugD = 1.2; props.rugColor = '#C2A6A0'; }
     if (type === 'desk' || type === 'dresser' || type === 'chair') props.wood = 'mid';
-    if (isWallType(type)) props.wall = defaultWall[type] ?? 'back';
+    if (isWallType(type)) props.wall = (defaultWall as Record<ItemType, WallSide | undefined>)[type] ?? 'back';
 
     const pos: [number, number, number] =
       isWallType(type) ? initWallPos(props.wall!) : nextFloorSlot(items, steps.grid);
@@ -105,7 +171,6 @@ export default function Page() {
     setSelectedId(id);
   };
 
-  /* ── Remove ── */
   const removeSelected = () => {
     if (!selectedId) return;
     setItems((p) => p.filter((i) => i.id !== selectedId));
@@ -113,8 +178,8 @@ export default function Page() {
   };
 
   /* ── Move/Rotate/Scale (buttons) ── */
-  const sel = items.find((i) => i.id === selectedId) || null;
-  const WALL_INSET = 0.2; // 벽걸이 수평/높이 이동 범위에서 살짝 안쪽으로 제한
+  const sel = items.find((i) => i.id === selectedId) ?? null;
+  const WALL_INSET = 0.2;
 
   const moveDir = (dir: 'left'|'right'|'up'|'down') => {
     if (!sel) return;
@@ -124,7 +189,7 @@ export default function Page() {
       const { grid, gridY } = steps;
       setItems((prev) => prev.map((it) => {
         if (it.id !== sel.id) return it;
-        let [x,y,z] = it.position;
+        let [x,y] = it.position;
         if (side === 'back') {
           if (dir === 'left')  x = quantize(clamp(x - grid, -ROOM.halfX + WALL_INSET, ROOM.halfX - WALL_INSET), grid);
           if (dir === 'right') x = quantize(clamp(x + grid, -ROOM.halfX + WALL_INSET, ROOM.halfX - WALL_INSET), grid);
@@ -132,6 +197,7 @@ export default function Page() {
           if (dir === 'down')  y = quantize(clamp(y - gridY, 0.2, ROOM.height - 0.6), gridY);
           return { ...it, position: [x, y, FRONT.BACK_Z], rotationY: 0 };
         } else {
+          let z = it.position[2];
           if (dir === 'left')  z = quantize(clamp(z + grid, -ROOM.halfZ + WALL_INSET, ROOM.halfZ - WALL_INSET), grid);
           if (dir === 'right') z = quantize(clamp(z - grid, -ROOM.halfZ + WALL_INSET, ROOM.halfZ - WALL_INSET), grid);
           if (dir === 'up')    y = quantize(clamp(y + gridY, 0.2, ROOM.height - 0.6), gridY);
@@ -165,34 +231,14 @@ export default function Page() {
     setItems((prev) => prev.map((it) => it.id === sel.id ? { ...it, scale: clamp(it.scale + ds, 0.3, 2.2) } : it));
   };
 
-  /* ── Hold-to-repeat (buttons) ── */
-  const useHold = (fn: () => void, delay = 65) => {
-    const t = useRef<any>(null);
-    return {
-      onMouseDown: () => { fn(); t.current = setInterval(fn, delay); },
-      onMouseUp:   () => t.current && clearInterval(t.current),
-      onMouseLeave:() => t.current && clearInterval(t.current),
-      onTouchStart:() => { fn(); t.current = setInterval(fn, delay); },
-      onTouchEnd:  () => t.current && clearInterval(t.current),
-    };
-  };
-  const mvL = useHold(() => moveDir('left'));
-  const mvR = useHold(() => moveDir('right'));
-  const mvU = useHold(() => moveDir('up'));
-  const mvD = useHold(() => moveDir('down'));
-  const rtL = useHold(() => rotateBy(+steps.rotate));
-  const rtR = useHold(() => rotateBy(-steps.rotate));
-  const scP = useHold(() => scaleBy(+steps.scale));
-  const scM = useHold(() => scaleBy(-steps.scale));
+  /* ── Drag state (controls disable/enable) ── */
+  const dragRef = useRef<DragState>({ id: null, kind: null, offset: new THREE.Vector3() });
 
-  /* ── Drag state ── */
-  const dragRef = useRef<{ id: string|null; kind: 'floor'|'back'|'left'|null; offset: THREE.Vector3 }>(
-    { id: null, kind: null, offset: new THREE.Vector3() }
-  );
   const startDrag = (it: Item, ePoint: THREE.Vector3) => {
     dragRef.current.id = it.id;
+    if (controlsRef.current) controlsRef.current.enabled = false; // 팬 비활성
     if (isWallType(it.type)) {
-      const side = (it.props?.wall ?? defaultWall[it.type]) as WallSide;
+      const side = (it.props?.wall ?? defaultWall[it.type as ItemType]) as WallSide;
       dragRef.current.kind = side === 'back' ? 'back' : 'left';
       if (side === 'back') dragRef.current.offset.set(it.position[0] - ePoint.x, it.position[1] - ePoint.y, 0);
       else dragRef.current.offset.set(0, it.position[1] - ePoint.y, it.position[2] - ePoint.z);
@@ -201,7 +247,12 @@ export default function Page() {
       dragRef.current.offset.set(it.position[0] - ePoint.x, 0, it.position[2] - ePoint.z);
     }
   };
-  const endDrag = () => { dragRef.current.id = null; dragRef.current.kind = null; };
+
+  const endDrag = useCallback(() => {
+    dragRef.current.id = null;
+    dragRef.current.kind = null;
+    if (controlsRef.current) controlsRef.current.enabled = true; // 팬 재활성
+  }, []);
 
   return (
     <main style={{ width: '100vw', height: '100vh', background: '#F5EFEA' }}>
@@ -223,6 +274,21 @@ export default function Page() {
           <Seg onClick={removeSelected}>Delete</Seg>
           <Seg onClick={()=>{ setItems([]); setSelectedId(null); }}>Clear All</Seg>
         </Pill>
+
+        {/* Save / Load */}
+        <Pill>
+          <Seg onClick={doSaveLocal}>Save</Seg>
+          <Seg onClick={doLoadLocal}>Load</Seg>
+          <Seg onClick={doExportJSON}>Export</Seg>
+          <Seg onClick={()=>fileRef.current?.click()}>Import</Seg>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json"
+            style={{ display:'none' }}
+            onChange={(e)=>doImportJSON(e.target.files?.[0])}
+          />
+        </Pill>
       </div>
 
       {/* Shelf */}
@@ -231,10 +297,16 @@ export default function Page() {
       {/* Pads */}
       <div style={{ position:'absolute', bottom:16, left:'50%', transform:'translateX(-50%)',
         display:'flex', gap:10, zIndex:15, fontFamily:'ui-sans-serif, system-ui' }}>
-        <Pad><PadRow><PadBtn {...mvU}>↑</PadBtn></PadRow>
-             <PadRow><PadBtn {...mvL}>←</PadBtn><PadBtn {...mvD}>↓</PadBtn><PadBtn {...mvR}>→</PadBtn></PadRow></Pad>
-        <Pad><PadRow><PadBtn {...rtL}>⟳</PadBtn><PadBtn {...rtR}>⟲</PadBtn></PadRow></Pad>
-        <Pad><PadRow><PadBtn {...scM}>－</PadBtn><PadBtn {...scP}>＋</PadBtn></PadRow></Pad>
+        <Pad><PadRow><PadBtn onMouseDown={()=>moveDir('up')} onTouchStart={()=>moveDir('up')}>↑</PadBtn></PadRow>
+             <PadRow>
+               <PadBtn onMouseDown={()=>moveDir('left')} onTouchStart={()=>moveDir('left')}>←</PadBtn>
+               <PadBtn onMouseDown={()=>moveDir('down')} onTouchStart={()=>moveDir('down')}>↓</PadBtn>
+               <PadBtn onMouseDown={()=>moveDir('right')} onTouchStart={()=>moveDir('right')}>→</PadBtn>
+             </PadRow></Pad>
+        <Pad><PadRow><PadBtn onMouseDown={()=>rotateBy(+steps.rotate)} onTouchStart={()=>rotateBy(+steps.rotate)}>⟳</PadBtn>
+                   <PadBtn onMouseDown={()=>rotateBy(-steps.rotate)} onTouchStart={()=>rotateBy(-steps.rotate)}>⟲</PadBtn></PadRow></Pad>
+        <Pad><PadRow><PadBtn onMouseDown={()=>scaleBy(-steps.scale)} onTouchStart={()=>scaleBy(-steps.scale)}>－</PadBtn>
+                   <PadBtn onMouseDown={()=>scaleBy(+steps.scale)} onTouchStart={()=>scaleBy(+steps.scale)}>＋</PadBtn></PadRow></Pad>
       </div>
 
       {/* Help */}
@@ -262,20 +334,16 @@ export default function Page() {
         />
       )}
 
-      <Canvas
-        shadows
-        onPointerMissed={() => { setSelectedId(null); endDrag(); }}
-      >
-        {/* 정사영 고정 시점 + MapControls(팬만) */}
-        <SceneCamera zoom={zoom} />
+      <Canvas shadows onPointerMissed={() => { setSelectedId(null); endDrag(); }}>
+        {/* 카메라 + 팬(이동) 전용 컨트롤 */}
+        <SceneCamera zoom={zoom} controlsRef={controlsRef} />
 
         <SceneRoom theme={theme} />
-
         <ambientLight intensity={0.6} />
         <directionalLight position={[6,10,6]} intensity={1.1} castShadow shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
 
-        {/* Drag catchers (방 경계 크기만큼만) */}
-        <DragCatchers dragRef={dragRef} steps={steps} setItems={setItems} />
+        {/* Drag catchers: 드래그 종료 시에도 팬 재활성화 */}
+        <DragCatchers dragRef={dragRef} steps={steps} setItems={setItems} onRelease={endDrag} />
 
         {items.map((it)=>(
           <ItemNode
@@ -296,11 +364,16 @@ export default function Page() {
   );
 }
 
-/* ───────────────── Camera with pan-only controls ───────────────── */
-function SceneCamera({ zoom }: { zoom: number }) {
-  const camRef = useRef<any>(null);
-  const ctrlRef = useRef<any>(null);
-  // 팬 한계(방 경계에서 약간 여유)
+/* ───────────────── Camera (pan-only) ───────────────── */
+function SceneCamera({ zoom, controlsRef }:{
+  zoom: number;
+  controlsRef: MutableRefObject<MapControlsImpl | null>;
+}) {
+  const camRef = useRef<THREE.OrthographicCamera | null>(null);
+  const ctrlRef = useRef<MapControlsImpl | null>(null);
+
+  useEffect(()=>{ controlsRef.current = ctrlRef.current; }, [controlsRef]);
+
   const PAN = { x: ROOM.halfX + 1.0, z: ROOM.halfZ + 1.0 };
 
   useFrame(() => {
@@ -308,59 +381,40 @@ function SceneCamera({ zoom }: { zoom: number }) {
     if (!ctrl) return;
     const t = ctrl.target as THREE.Vector3;
     const obj = ctrl.object as THREE.Camera & { position: THREE.Vector3 };
-
     const nx = clamp(t.x, -PAN.x, PAN.x);
     const nz = clamp(t.z, -PAN.z, PAN.z);
-    const dx = nx - t.x;
-    const dz = nz - t.z;
-    if (dx || dz) {
-      t.set(nx, t.y, nz);
-      obj.position.x += dx;
-      obj.position.z += dz;
-      ctrl.update();
-    }
+    const dx = nx - t.x, dz = nz - t.z;
+    if (dx || dz) { t.set(nx, t.y, nz); obj.position.x += dx; obj.position.z += dz; ctrl.update(); }
   });
 
   return (
     <>
-      <OrthographicCamera
-        ref={camRef}
-        makeDefault
-        zoom={zoom}
-        position={[7,7,7]}
-        // 초기 시선만 0,0,0 으로; 이후 MapControls가 관리
-        onUpdate={(c)=>c.lookAt(0,0,0)}
-      />
-      <MapControls
-        ref={ctrlRef}
-        enableRotate={false}
-        enableZoom={false}           // 휠 줌 금지 (상단 UI로만)
-        screenSpacePanning
-        panSpeed={1}
-      />
+      <OrthographicCamera ref={camRef} makeDefault zoom={zoom} position={[7,7,7]} onUpdate={(c)=>c.lookAt(0,0,0)} />
+      <MapControls ref={ctrlRef} enableRotate={false} enableZoom={false} screenSpacePanning panSpeed={1} />
     </>
   );
 }
 
-/* ───────────────── Drag catchers (겹침 + 상판 스냅 + 경계 제한) ───────────────── */
+/* ───────────────── Drag catchers ───────────────── */
 function DragCatchers({
-  dragRef, steps, setItems,
+  dragRef, steps, setItems, onRelease,
 }:{
-  dragRef: React.MutableRefObject<{ id: string|null; kind: 'floor'|'back'|'left'|null; offset: THREE.Vector3 }>;
-  steps: { grid: number; gridY: number; move: number; rotate: number; scale: number };
+  dragRef: MutableRefObject<DragState>;
+  steps: Steps;
   setItems: React.Dispatch<React.SetStateAction<Item[]>>;
+  onRelease: () => void;
 }) {
   const { gl } = useThree();
 
   useEffect(() => {
-    const up = () => { dragRef.current.id = null; dragRef.current.kind = null; };
+    const up: (ev: PointerEvent) => void = () => { onRelease(); };
     gl.domElement.addEventListener('pointerup', up);
     return () => gl.domElement.removeEventListener('pointerup', up);
-  }, [gl, dragRef]);
+  }, [gl, onRelease]);
 
   return (
     <>
-      {/* 바닥: 방 바닥 크기만큼 */}
+      {/* 바닥 */}
       <mesh
         position={[0, WORLD.FLOOR_Y, 0]}
         rotation={[-Math.PI/2, 0, 0]}
@@ -418,25 +472,27 @@ function DragCatchers({
 }
 
 /* ───────────────── UI ───────────────── */
-function Pill({ children }: { children: React.ReactNode }) {
+function Pill({ children }: { children: ReactNode }) {
   return <div style={{ display:'inline-flex', alignItems:'center', gap:6, padding:'6px 8px', borderRadius:999, background:'#FFFFFFCC',
     border:`1px solid ${UI.btnBorder}`, boxShadow:'0 6px 16px rgba(0,0,0,0.06)' }}>{children}</div>;
 }
-function Label({ children }: { children: React.ReactNode }) {
+function Label({ children }: { children: ReactNode }) {
   return <span style={{ fontSize:12, color:'#6B5E57', padding:'0 4px' }}>{children}</span>;
 }
-function Seg({ children, active, onClick }:{children: React.ReactNode; active?: boolean; onClick?: ()=>void;}) {
+function Seg({ children, onClick, active }:{
+  children: ReactNode; onClick?:()=>void; active?:boolean
+}) {
   return <button onClick={onClick} style={{ padding:'6px 10px', borderRadius:8, border:`1px solid ${UI.btnBorder}`,
     background: active?'#3A332F':'#fff', color: active?'#fff':UI.btnText, cursor:'pointer', fontSize:13 }}>{children}</button>;
 }
-function Pad({ children }: { children: React.ReactNode }) {
+function Pad({ children }: { children: ReactNode }) {
   return <div style={{ background: UI.panel, border:`2px solid ${UI.btnBorder}`, borderRadius:12, padding:8,
     display:'inline-flex', flexDirection:'column', gap:6, boxShadow:'0 10px 24px rgba(0,0,0,0.12)' }}>{children}</div>;
 }
-function PadRow({ children }: { children: React.ReactNode }) {
+function PadRow({ children }: { children: ReactNode }) {
   return <div style={{ display:'flex', gap:6, justifyContent:'center' }}>{children}</div>;
 }
-function PadBtn(props:any) {
+function PadBtn(props: ButtonHTMLAttributes<HTMLButtonElement>) {
   return <button {...props} style={{ width:44, height:44, borderRadius:10, border:`2px solid ${UI.btnBorder}`, background:'#fff',
     fontSize:18, color:UI.btnText, cursor:'pointer', userSelect:'none', touchAction:'none' }} />;
 }
@@ -452,7 +508,7 @@ function HelpTip() {
       display: 'inline-block', width: 'auto', maxWidth: 'max-content',
       boxShadow: '0 8px 18px rgba(0,0,0,0.18)',
     }}>
-      마우스 드래그로 화면 이동(팬) · 회전/휠줌은 비활성 · 드래그로 배치, 패드로 미세 이동/회전/크기
+      화면 이동(팬)은 빈 공간 드래그, 오브젝트 드래그 중엔 자동 비활성 · ⌨︎ 패드 버튼으로 미세 조정
     </div>
   );
 }
@@ -462,7 +518,7 @@ function Shelf({ onAdd, themeIdx, setThemeIdx }:{
   onAdd:(t:ItemType)=>void; themeIdx:number; setThemeIdx:(n:number)=>void;
 }) {
   return (
-    <aside style={{ position:'absolute', right:12, top:12, bottom:12, width:240, background:UI.panel, border:`2px solid ${UI.btnBorder}`,
+    <aside style={{ position:'absolute', right:12, top:12, bottom:12, width:260, background:UI.panel, border:`2px solid ${UI.btnBorder}`,
       borderRadius:12, padding:12, boxShadow:'0 12px 28px rgba(0,0,0,0.12)', zIndex:15, display:'flex', flexDirection:'column', gap:10, overflow:'hidden',
       fontFamily:'ui-sans-serif, system-ui', color:UI.panelText }}>
       <div style={{ fontWeight:700, letterSpacing:2, textAlign:'center', padding:'6px 0' }}>ITEMS</div>
@@ -480,7 +536,7 @@ function Shelf({ onAdd, themeIdx, setThemeIdx }:{
     </aside>
   );
 }
-function ItemBtn({ children, onClick }:{children: React.ReactNode; onClick: ()=>void;}) {
+function ItemBtn({ children, onClick }:{children: ReactNode; onClick: ()=>void;}) {
   return <button onClick={onClick} style={{ padding:'10px 8px', borderRadius:10, border:`2px solid ${UI.btnBorder}`, background:'#fff',
     color:UI.btnText, fontWeight:600, cursor:'pointer', textTransform:'capitalize' }}>{children}</button>;
 }
@@ -559,7 +615,6 @@ function SceneRoom({ theme }: { theme: Theme }) {
   const floorC = useMemo(() => new THREE.Color(theme.floor), [theme.floor]);
   const wallC  = useMemo(() => new THREE.Color(theme.wall), [theme.wall]);
 
-  // 간결한 플로어(방 크기만)
   const Floor = () => (
     <mesh position={[0, 0.001, 0]} rotation={[-Math.PI/2,0,0]} receiveShadow>
       <planeGeometry args={[ROOM.halfX*2, ROOM.halfZ*2]} />
@@ -570,12 +625,10 @@ function SceneRoom({ theme }: { theme: Theme }) {
   return (
     <group>
       <Floor />
-      {/* Back wall (박스 두께 포함, 앞면은 FRONT.BACK_Z) */}
       <mesh position={[0, ROOM.height/2, WORLD.BACK_Z]} receiveShadow castShadow>
         <boxGeometry args={[ROOM.halfX*2, ROOM.height, WALL.thick]} />
         <meshStandardMaterial color={wallC} roughness={1} />
       </mesh>
-      {/* Left wall */}
       <mesh position={[WORLD.LEFT_X, ROOM.height/2, 0]} rotation={[0, Math.PI/2, 0]} receiveShadow castShadow>
         <boxGeometry args={[ROOM.halfZ*2, ROOM.height, WALL.thick]} />
         <meshStandardMaterial color={wallC} roughness={1} />
@@ -593,7 +646,7 @@ function ItemNode({
   onStartDrag: (it: Item, p: THREE.Vector3) => void;
   onEndDrag: () => void;
 }) {
-  const g = useRef<THREE.Group>(null);
+  const g = useRef<THREE.Group | null>(null);
   const targetPos   = useRef(new THREE.Vector3(...item.position));
   const targetRotY  = useRef(item.rotationY);
   const targetScale = useRef(item.scale);
@@ -622,21 +675,9 @@ function ItemNode({
       <ItemMesh type={item.type} props={item.props} selected={selected} />
       {!hideLabel && selected && (
         <Html transform distanceFactor={8}>
-          <div
-            style={{
-              display: 'inline-block',
-              width: 'auto',
-              maxWidth: 'max-content',
-              padding: '6px 8px',
-              borderRadius: 8,
-              background: UI.badgeBG,
-              color: '#fff',
-              fontSize: 11,
-              whiteSpace: 'nowrap',
-              userSelect: 'none',
-              pointerEvents: 'none',
-            }}
-          >
+          <div style={{ display:'inline-block', width:'auto', maxWidth:'max-content', padding:'6px 8px',
+                        borderRadius:8, background: UI.badgeBG, color:'#fff', fontSize:11,
+                        whiteSpace:'nowrap', userSelect:'none', pointerEvents:'none' }}>
             {item.type}
           </div>
         </Html>
@@ -700,7 +741,7 @@ function DeskMesh({ sel, tone }:{ sel?:boolean; tone:WoodTone }) {
       {[
         [-0.58, 0.31, -0.26],[0.58, 0.31, -0.26],[-0.58, 0.31, 0.26],[0.58, 0.31, 0.26],
       ].map((p,i)=>(
-        <mesh key={i} castShadow receiveShadow position={p as any}><boxGeometry args={[0.06, 0.62, 0.06]} /><meshStandardMaterial color={c.leg} roughness={1} /></mesh>
+        <mesh key={i} castShadow receiveShadow position={p as [number,number,number]}><boxGeometry args={[0.06, 0.62, 0.06]} /><meshStandardMaterial color={c.leg} roughness={1} /></mesh>
       ))}
       <SelGlow active={!!sel} />
     </group>
@@ -726,7 +767,7 @@ function ChairMesh({ sel, tone }:{ sel?:boolean; tone:WoodTone }) {
       {[
         [-0.22, 0.225, -0.22], [0.22, 0.225, -0.22], [-0.22, 0.225,  0.22], [0.22, 0.225,  0.22],
       ].map((p,i)=>(
-        <mesh key={i} castShadow receiveShadow position={p as any}><boxGeometry args={[0.05, 0.45, 0.05]} /><meshStandardMaterial color={c.leg} roughness={1} /></mesh>
+        <mesh key={i} castShadow receiveShadow position={p as [number,number,number]}><boxGeometry args={[0.05, 0.45, 0.05]} /><meshStandardMaterial color={c.leg} roughness={1} /></mesh>
       ))}
       <mesh castShadow receiveShadow position={[0, 0.75, -0.22]}><boxGeometry args={[0.5, 0.6, 0.05]} /><meshStandardMaterial color={c.base} roughness={1} /></mesh>
       <SelGlow active={!!sel} r={0.35} />
@@ -857,8 +898,8 @@ function wallRotation(type: ItemType, side?: WallSide) {
 function initWallPos(side: WallSide): [number, number, number] {
   return side === 'left' ? [FRONT.LEFT_X, 1.2, 0] : [0, 1.2, FRONT.BACK_Z];
 }
-function snapToWall([x,y,z]:[number, number, number], side: WallSide): [number, number, number] {
-  if (side === 'left') return [FRONT.LEFT_X, clamp(y, 0.2, ROOM.height - 0.6), clamp(z, -ROOM.halfZ + 0.2, ROOM.halfZ - 0.2)];
+function snapToWall([x,y]:[number, number, number], side: WallSide): [number, number, number] {
+  if (side === 'left') return [FRONT.LEFT_X, clamp(y, 0.2, ROOM.height - 0.6),  clamp(0, -ROOM.halfZ + 0.2, ROOM.halfZ - 0.2)];
   return [clamp(x, -ROOM.halfX + 0.2, ROOM.halfX - 0.2), clamp(y, 0.2, ROOM.height - 0.6), FRONT.BACK_Z];
 }
 function nextFloorSlot(existing: Item[], grid: number): [number, number, number] {
